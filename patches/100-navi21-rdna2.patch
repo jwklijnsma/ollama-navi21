@@ -1,0 +1,307 @@
+Navi21 / Radeon Pro V620 (gfx1030, RDNA2) fixes for the llama.cpp that Ollama builds.
+
+Ported from https://github.com/sixvolts/llama-navi21-furnace (MIT) onto
+llama.cpp b12257 (also applies cleanly to b12177 = Ollama v0.40.16).
+Applied automatically by Ollama's llama/compat patch applier.
+
+Source commits (sixvolts/llama-navi21-furnace):
+  a63536900 navi21: gfx1030 (RDNA2) flash-attn tile config fix
+  3ceecec3a navi21: extend gfx1030 flash-attn tile fix to D=128
+  9b1ceb1fc navi21: fix gfx1030 flash-attn occupancy abort at D=576 (DeepSeek MLA)
+  a02ddd408 navi21: fix gfx1030 flash-attn occupancy abort for D=256 MHA (ncols2=1)
+  6546a0145 navi21: scope the flash-attn tile fixes to RDNA2, restore upstream for RDNA3/4
+  b96c5233d cuda: compute flash-attention occupancy on RDNA2, retune the D=256 tile
+  abef34ca5 cuda: retune the RDNA2 D=256 tile for 3-8 token verify batches
+  f75d2cd02 cuda: apply the K-quant sub-block scale in float on AMD (MMQ)
+  0aa20a02b navi21: add missing RDNA2 entry to the MMVQ config tables
+  b5f65d215 navi21: use 2 waves, not 4, for the MMVQ verify shape (ncols_dst 2..8)
+  05512bb1d navi21: widen the MMVQ block for the ncols_dst 5..8 verify shape
+  (0aa20a02b and 05512bb1d hand-merged onto upstream's newer calc_rows_per_block signature)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 26a432d89..15d8b50b9 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -1152,6 +1152,31 @@ void launch_fattn(
+     const dim3 block_dim(warp_size, nwarps, 1);
+     int max_blocks_per_sm = 1; // Max. number of active blocks limited by occupancy.
+     CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, block_dim.x * block_dim.y * block_dim.z, nbytes_shared));
++#ifdef GGML_USE_HIP
++    // HIP's occupancy calculator assumes regsPerMultiprocessor = 32768 on RDNA2, a quarter of a
++    // WGP's real register file (4 SIMDs x 1024 VGPRs x 32 lanes in wave32). It therefore reports 0
++    // blocks for kernels above 128 VGPRs that the hardware runs, and too few blocks for the rest,
++    // which starves the KV-split decode kernels of parallelism. Compute it from the kernel's
++    // registers and LDS against the WGP instead.
++    if (GGML_CUDA_CC_IS_RDNA2(cc) && warp_size == 32) {
++        hipFuncAttributes attr;
++        CUDA_CHECK(hipFuncGetAttributes(&attr, (const void *) fattn_kernel));
++        const int nthreads        = block_dim.x * block_dim.y * block_dim.z;
++        const int waves_per_block = (nthreads + warp_size - 1) / warp_size;
++        const int vgprs           = std::max(8, (attr.numRegs + 7) / 8 * 8);
++        // at most 8 waves/SIMD: measured on the split-KV decode kernels, more resident blocks than
++        // that (e.g. 22 instead of 16 for a 2-wave block) choose a worse KV split and run slower
++        const int waves_per_simd  = std::min(8, 1024 / vgprs);
++        const size_t lds          = attr.sharedSizeBytes + nbytes_shared;
++        int blocks = 4*waves_per_simd / waves_per_block;
++        if (lds > 0) {
++            blocks = std::min(blocks, int((128*1024) / lds));
++        }
++        if (attr.maxThreadsPerBlock >= nthreads && blocks > max_blocks_per_sm) {
++            max_blocks_per_sm = blocks;
++        }
++    }
++#endif // GGML_USE_HIP
+     GGML_ASSERT(max_blocks_per_sm > 0);
+     int parallel_blocks = max_blocks_per_sm;
+ 
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index ba4628fec..21719cc81 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -312,8 +312,47 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
+     return 0;
+ }
+ 
++// RDNA2 (gfx1030) overrides. RDNA2 has no WMMA, so every flash-attention call lands on the
++// tile kernel. The occupancy-1 entries date from when HIP's occupancy query (which undercounts
++// the RDNA2 register file, see launch_fattn) made larger configs abort; launch_fattn now
++// computes RDNA2 occupancy itself. The D=256 ncols 8/16/32 entries were re-tuned after that
++// on a V620 with the Qwen3.5 shape (24 Q heads over 4 KV heads): nbatch_fa 64 instead of 32,
++// +31% on prefill attention, -17% / -30% time on 8- and 4-token verify batches at 64k.
++// The RDNA table is left as upstream tuned it: RDNA3/4 also use the tile kernel for decode
++// and small batches, and have the larger register file those values assume.
++static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_amd_rdna2(const int DKQ, const int DV, const int ncols) {
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  2,  64, 1,  32,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  4, 128, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128,  8, 128, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 16, 256, 1, 128, 128)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 32, 256, 1, 128,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(128, 128, 64, 256, 1,  64,  64)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 1,  32,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 1,  32, 256)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 1, 128,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 1,  64,  64)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  2,  64, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  4, 128, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512,  8, 256, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 16, 256, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(512, 512, 32, 256, 1, 128,  64)
++
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  4, 128, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512,  8, 256, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 16, 256, 1,  64,  64)
++    GGML_CUDA_FATTN_TILE_CONFIG_CASE(576, 512, 32, 256, 1, 128,  64)
++
++    return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
++}
++
+ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols, const int cc) {
+     if (GGML_CUDA_CC_IS_AMD(cc)) {
++        if (GGML_CUDA_CC_IS_RDNA2(cc)) {
++            return ggml_cuda_fattn_tile_get_config_amd_rdna2(DKQ, DV, ncols);
++        }
+         if (GGML_CUDA_CC_IS_RDNA(cc)) {
+             return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+         }
+@@ -327,11 +366,13 @@ static __host__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const in
+ 
+ static constexpr __device__ uint32_t ggml_cuda_fattn_tile_get_config(const int DKQ, const int DV, const int ncols) {
+ #ifdef GGML_USE_HIP
+-#ifdef RDNA
++#if defined(RDNA2)
++    return ggml_cuda_fattn_tile_get_config_amd_rdna2(DKQ, DV, ncols);
++#elif defined(RDNA)
+     return ggml_cuda_fattn_tile_get_config_amd_rdna(DKQ, DV, ncols);
+ #else
+     return ggml_cuda_fattn_tile_get_config_amd(DKQ, DV, ncols);
+-#endif // RDNA
++#endif // RDNA2 / RDNA
+ #else
+ #ifdef FAST_FP16_AVAILABLE
+     return ggml_cuda_fattn_tile_get_config_nvidia_fp16(DKQ, DV, ncols);
+@@ -1157,9 +1198,24 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+ 
+     constexpr size_t nbytes_shared = 0;
+ 
++    // RDNA2 (gfx1030): even at occupancy 1 (see ggml_cuda_fattn_tile_get_config_amd_rdna2),
++    // some wide-column kernels still fail the occupancy query and abort, so cap cols_per_block:
++    //   D=512 (Gemma global attention): the ncols2<=2 kernels are not instantiated for
++    //     DV=512, so cap cols_per_block<=8 to keep the accumulator set in registers.
++    //   D=128: cols_per_block 16/32/64 need 33-43 KB LDS; cap to <=8 (with ncols2<=2 from
++    //     switch_ncols2).
++    //   D=576/DV=512 (DeepSeek MLA): cols_per_block=32 (kernel <512,8,4>) fails; cap to <=16.
++    //   D=256 MHA/odd GQA (ncols2==1): <256,32,1> fails; cap to <=8. The GQA ncols2>=2 path
++    //     keeps its working cols_per_block=32 (<256,16,2>) tile.
++    const bool rdna2       = GGML_CUDA_CC_IS_RDNA2(cc);
++    const bool rdna512     = rdna2 && DKQ == 512;
++    const bool rdna_d128   = rdna2 && DKQ == 128;
++    const bool rdna576     = rdna2 && DKQ == 576;
++    const bool rdna256_mha = rdna2 && DKQ == 256 && ncols2 == 1;
++
+ #ifdef GGML_USE_HIP
+     if constexpr (DKQ <= 128) {
+-        if (Q->ne[1] > 32/ncols2) {
++        if (!rdna_d128 && Q->ne[1] > 32/ncols2) {
+             constexpr int cols_per_block = 64;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -1175,7 +1231,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+     if constexpr (DKQ <= 256)
+ #endif // GGML_USE_HIP
+     {
+-        if (Q->ne[1] > 16/ncols2) {
++        if (!rdna512 && !rdna_d128 && !rdna576 && !rdna256_mha && Q->ne[1] > 16/ncols2) {
+             constexpr int cols_per_block = 32;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -1187,7 +1243,7 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
+     }
+ 
+     if constexpr (ncols2 <= 16) {
+-        if (Q->ne[1] > 8/ncols2) {
++        if (!rdna512 && !rdna_d128 && !rdna256_mha && Q->ne[1] > 8/ncols2) {
+             constexpr int cols_per_block = 16;
+             const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, cols_per_block, cc) / warp_size;
+             const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, cols_per_block, cc);
+@@ -1250,10 +1306,16 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+ 
+     // On NVIDIA (Pascal and older) the GQA optimizations seem to be detrimental in some cases.
+     // However, for DKQ == 576, DV == 512 only the kernel variant with GQA optimizations is implemented.
+-    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
++    const int device_cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(device_cc);
+     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
+     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+ 
++    // RDNA2 (gfx1030): the D=128/256 ncols2>=4 variants carry 4+ DV accumulators per thread and
++    // overflow the register file (occupancy query returns 0 -> abort), so cap ncols2<=2.
++    // Wave64 GCN fits the wider kernels, and RDNA3/4 keep upstream's selection.
++    const bool rdna_cap_ncols2 = GGML_CUDA_CC_IS_RDNA2(device_cc) && (DKQ == 256 || DKQ == 128);
++
+     if constexpr (DKQ == 320) {
+         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
+         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.
+@@ -1298,12 +1360,12 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
+     }
+ 
+     if constexpr (DKQ <= 512 && DKQ != 320 && DKQ != 192) {
+-        if (use_gqa_opt && gqa_ratio % 8 == 0) {
++        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 8 == 0) {
+             launch_fattn_tile_switch_ncols1<DKQ, DV, 8, use_logit_softcap>(ctx, dst);
+             return;
+         }
+ 
+-        if (use_gqa_opt && gqa_ratio % 4 == 0) {
++        if (!rdna_cap_ncols2 && use_gqa_opt && gqa_ratio % 4 == 0) {
+             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
+             return;
+         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 8f79123af..21a9d92e6 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -576,6 +576,24 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         }
+         return generic;
+     }
++    // RDNA2 (gfx1030) had no entry here and fell through to nwarps=1, i.e. every
++    // MMVQ dispatch ran as a single wave32 workgroup regardless of ncols_dst.
++    if (table_id == MMVQ_PARAMETERS_RDNA2) {
++        // ncols_dst == 1 (plain token generation) wants the wide block: 4 waves keep
++        // enough loads in flight to hold the memory roofline.
++        // ncols_dst > 1 is the speculative-decoding verify shape, where every wave also
++        // carries ncols_dst accumulators, so wide blocks stop paying. Measured on V620
++        // with Qwen3.5-27B (see calc_rows_per_block for the paired row counts):
++        //   2..4 (MTP, block 4):    nwarps 4 -> 2  = +6.3% on the batch-4 shape
++        //   5..8 (DFlash, block 8): nwarps 2 -> 1  = +7.6% on the batch-8 shape
++        if (ncols_dst == 1) {
++            return 4;
++        }
++        if (ncols_dst <= 4) {
++            return 2;
++        }
++        return 1;
++    }
+     return 1;
+ }
+ 
+@@ -594,6 +612,27 @@ static constexpr __host__ __device__ bool mmvq_two_rows_ncols1(ggml_type type) {
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (table_id == MMVQ_PARAMETERS_RDNA2) {
++        switch (ncols_dst) {
++            case 1:
++                return small_k ? nwarps : 1;
++            case 2:
++            case 3:
++            case 4:
++                return 2;
++            // 5..8 is the block-drafter verify shape (DFlash block_size=8 -> 8 rows).
++            // Widening the block to 4 output rows amortises the 8 y-columns that every
++            // wave already holds in registers; rows_per_block=8 regresses and, at
++            // nwarps=1, fails test-backend-ops.
++            case 5:
++            case 6:
++            case 7:
++            case 8:
++                return 4;
++            default:
++                return 1;
++        }
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index d5ff93b91..c8d9efdf2 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -502,6 +502,17 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
+     return d3*d8 * sumi;
+ }
+ 
++// scale * dot-sum for the K-quant MMQ paths. The integer product is exact in fp32 (a scale of at
++// most 7 bits times a dot sum below 2^17), and on AMD v_mul_lo_u32 is quarter rate while the float
++// multiply is full rate, so do it in float there. Same result on both paths.
++static __device__ __forceinline__ float ggml_cuda_mmq_scale_sumi(const int sc, const int sumi) {
++#ifdef GGML_USE_HIP
++    return (float) sc * (float) sumi;
++#else
++    return (float) (sc * sumi);
++#endif // GGML_USE_HIP
++}
++
+ #define VDR_Q4_K_Q8_1_MMVQ 2
+ #define VDR_Q4_K_Q8_1_MMQ  8
+ 
+@@ -549,7 +560,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
++        sumf_d += ds8f.x * ggml_cuda_mmq_scale_sumi(sc[i], sumi_d);
+         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+     }
+ 
+@@ -612,7 +623,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+ 
+         const float2 ds8f = __half22float2(ds8[i]);
+ 
+-        sumf_d += ds8f.x * (sc[i] * sumi_d);
++        sumf_d += ds8f.x * ggml_cuda_mmq_scale_sumi(sc[i], sumi_d);
+         sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+     }
+ 
+@@ -675,7 +686,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
+             sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
+         }
+ 
+-        sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
++        sumf_d += d8[i0/4] * (ggml_cuda_mmq_scale_sumi(sc_reg[i0/2+0], sumi_d.x) + ggml_cuda_mmq_scale_sumi(sc_reg[i0/2+1], sumi_d.y));
+     }
+ 
+     return d6 * sumf_d;

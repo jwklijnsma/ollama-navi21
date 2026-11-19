@@ -1,0 +1,27 @@
+name: patch-check
+
+# Checks that the Navi21 patch still applies to the llama.cpp version pinned
+# by the latest Ollama release and by Ollama main. Runs weekly, so a new
+# Ollama release that breaks the patch shows up as a failed run.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ollama_ref: [latest, main]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply patches to Ollama ${{ matrix.ollama_ref }}
+        run: ./check-patch.sh "${{ matrix.ollama_ref }}"
