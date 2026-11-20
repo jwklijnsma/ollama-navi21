@@ -22,6 +22,6 @@ jobs:
       matrix:
         ollama_ref: [latest, main]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Apply patches to Ollama ${{ matrix.ollama_ref }}
         run: ./check-patch.sh "${{ matrix.ollama_ref }}"
