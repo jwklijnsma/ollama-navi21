@@ -25,3 +25,22 @@ jobs:
       - uses: actions/checkout@v7
       - name: Apply patches to Ollama ${{ matrix.ollama_ref }}
         run: ./check-patch.sh "${{ matrix.ollama_ref }}"
+
+  vllm-ref:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Pinned vLLM ref still exists and has gfx1030 support
+        run: |
+          set -euo pipefail
+          ref="$(sed -n 's/^VLLM_REF="\${VLLM_REF:-\([0-9a-f]*\)}"/\1/p' vllm/build.sh)"
+          echo "vLLM ref: $ref"
+          git init -q v && cd v
+          git fetch -q --depth 1 --filter=blob:none https://github.com/vllm-project/vllm "$ref"
+          git show FETCH_HEAD:vllm/platforms/rocm.py | grep -q on_gfx10x
+          echo "OK: $ref has on_gfx10x()"
+          # Tell us when upstream main gains gfx1030 support (time to switch VLLM_REF=main)
+          git fetch -q --depth 1 --filter=blob:none https://github.com/vllm-project/vllm main
+          if git show FETCH_HEAD:vllm/platforms/rocm.py | grep -q on_gfx10x; then
+            echo "::notice::vLLM main now has gfx1030 support — consider VLLM_REF=main"
+          fi

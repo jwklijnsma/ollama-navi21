@@ -101,6 +101,10 @@ ollama run qwen3.5:27b --verbose "schrijf een haiku over Friesland"
 - Upstream heeft tussen de basis van de fork (sept. 2026) en b12257 ~1200 commits; de FA-launchlogica is daarin ook veranderd. Draai bij twijfel `test-backend-ops -o FLASH_ATTN_EXT` en `-o MUL_MAT` uit een llama.cpp-build met dezelfde patch.
 - Bij een nieuwe Ollama-release faalt `build.sh` netjes in stap 3 als de patch niet meer past.
 
+## vLLM (DeepSeek)
+
+In [`vllm/`](vllm/) staat een build voor vLLM op gfx1030 (vanaf vLLM PR #52391), met een docker-compose om DeepSeek-R1-Distill over beide V620's te serveren. Er is ook een experimentele service voor DeepSeek-Coder-V2-Lite (MLA). Zie [vllm/README.md](vllm/README.md).
+
 ## CI
 
 `.github/workflows/patch-check.yml` draait wekelijks (en bij elke push) `check-patch.sh` tegen de laatste Ollama-release en Ollama `main`. Een rode run betekent dat een nieuwe Ollama-versie een andere llama.cpp pint waar de patch niet meer op past.
