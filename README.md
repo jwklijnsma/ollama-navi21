@@ -110,6 +110,16 @@ ollama run qwen3.5:27b --verbose "schrijf een haiku over Friesland"
 ./check-patch.sh main
 ```
 
+## Releases
+
+`.github/workflows/release.yml` maakt automatisch een GitHub-release (tag + patch + scripts, geen binaries):
+
+- **na elke gemergede pull request** naar `main`;
+- **wekelijks** (maandagochtend), maar alleen als er iets veranderd is: nieuwe commits sinds de vorige release, of een nieuwe Ollama-release;
+- **handmatig** via *Actions → release → Run workflow* (met `force` voor een release zonder wijzigingen).
+
+Tags heten `v<ollama-versie>-navi21.<n>`, bijv. `v0.40.16-navi21.1`. Er komt alleen een release als de patch op die Ollama-versie past; `build.sh` in de release-tarball staat standaard op die versie.
+
 ## Licentie
 
 De patch is afgeleid van [sixvolts/llama-navi21-furnace](https://github.com/sixvolts/llama-navi21-furnace) en [llama.cpp](https://github.com/ggml-org/llama.cpp), beide MIT. Ollama is MIT.

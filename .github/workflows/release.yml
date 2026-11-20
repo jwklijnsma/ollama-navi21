@@ -1,0 +1,119 @@
+name: release
+
+# Tags and publishes a release (patch + scripts, no binaries):
+#   - after a pull request is merged into main
+#   - weekly, but only when something changed: new commits since the last
+#     release, or a new Ollama release that the patch now targets
+#   - manually (workflow_dispatch, optionally forced)
+#
+# Tag format: v<ollama-version>-navi21.<n>   e.g. v0.40.16-navi21.1
+# A release is only made if the patch still applies to that Ollama version.
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  schedule:
+    - cron: "43 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if nothing changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event_name != 'pull_request' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Decide version
+        id: ver
+        env:
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          ollama="$(git ls-remote --tags --refs --sort=-v:refname https://github.com/ollama/ollama 'v*' \
+            | awk -F/ '{print $3}' | grep -v -- '-rc' | head -1)"
+          llama="$(curl -fsSL "https://raw.githubusercontent.com/ollama/ollama/${ollama}/LLAMA_CPP_VERSION" | tr -d '[:space:]')"
+
+          last="$(git tag --list 'v*-navi21.*' --sort=-creatordate | head -1)"
+          release=true
+          if [[ "$EVENT" == schedule && -n "$last" && "$FORCE" != true ]]; then
+            changed="$(git rev-list --count "${last}..HEAD")"
+            if [[ "$changed" == 0 && "$last" == "${ollama}-navi21."* ]]; then
+              release=false
+              echo "Nothing changed since $last and Ollama is still $ollama — skipping."
+            fi
+          fi
+
+          n="$(git tag --list "${ollama}-navi21.*" | sed 's/.*-navi21\.//' | sort -n | tail -1)"
+          tag="${ollama}-navi21.$(( ${n:-0} + 1 ))"
+
+          {
+            echo "release=$release"
+            echo "tag=$tag"
+            echo "last=$last"
+            echo "ollama=$ollama"
+            echo "llama=$llama"
+          } >> "$GITHUB_OUTPUT"
+          echo "Ollama $ollama / llama.cpp $llama -> $tag (release=$release)"
+
+      - name: Check patch against Ollama ${{ steps.ver.outputs.ollama }}
+        if: steps.ver.outputs.release == 'true'
+        run: ./check-patch.sh "${{ steps.ver.outputs.ollama }}"
+
+      - name: Package
+        if: steps.ver.outputs.release == 'true'
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          OLLAMA: ${{ steps.ver.outputs.ollama }}
+        run: |
+          set -euo pipefail
+          name="ollama-navi21-${TAG}"
+          mkdir -p "out/$name"
+          cp -r patches build.sh check-patch.sh README.md LICENSE "out/$name/"
+          # Default the build script to the Ollama version this release was checked against
+          sed -i "s/^OLLAMA_REF=\"\${OLLAMA_REF:-[^}]*}\"/OLLAMA_REF=\"\${OLLAMA_REF:-${OLLAMA}}\"/" "out/$name/build.sh"
+          grep -q "OLLAMA_REF:-${OLLAMA}}" "out/$name/build.sh"
+          tar -C out -czf "out/$name.tar.gz" "$name"
+          cp patches/*.patch out/
+          (cd out && sha256sum "$name.tar.gz" *.patch > SHA256SUMS)
+          ls -l out
+
+      - name: Create release
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+          LAST: ${{ steps.ver.outputs.last }}
+          OLLAMA: ${{ steps.ver.outputs.ollama }}
+          LLAMA: ${{ steps.ver.outputs.llama }}
+        run: |
+          set -euo pipefail
+          {
+            echo "Navi21 / Radeon Pro V620 (gfx1030) patch for **Ollama ${OLLAMA}** (llama.cpp \`${LLAMA}\`)."
+            echo
+            echo "Patch verified to apply cleanly to that version. Build with:"
+            echo
+            echo '```bash'
+            echo "tar xzf ollama-navi21-${TAG}.tar.gz && cd ollama-navi21-${TAG}"
+            echo "./build.sh tarball   # or: image | native"
+            echo '```'
+          } > notes.md
+          args=(--notes-file notes.md --generate-notes --target "$(git rev-parse HEAD)" --title "$TAG")
+          [[ -n "$LAST" ]] && args+=(--notes-start-tag "$LAST")
+          gh release create "$TAG" out/*.tar.gz out/*.patch out/SHA256SUMS "${args[@]}"
