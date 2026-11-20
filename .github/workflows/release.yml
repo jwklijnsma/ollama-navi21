@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           name="ollama-navi21-${TAG}"
           mkdir -p "out/$name"
-          cp -r patches build.sh check-patch.sh README.md LICENSE "out/$name/"
+          cp -r patches vllm build.sh check-patch.sh README.md LICENSE "out/$name/"
           # Default the build script to the Ollama version this release was checked against
           sed -i "s/^OLLAMA_REF=\"\${OLLAMA_REF:-[^}]*}\"/OLLAMA_REF=\"\${OLLAMA_REF:-${OLLAMA}}\"/" "out/$name/build.sh"
           grep -q "OLLAMA_REF:-${OLLAMA}}" "out/$name/build.sh"
